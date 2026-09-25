@@ -1,0 +1,14 @@
+{
+  "domain": "prix_carburant_totalenergies",
+  "name": "TotalEnergies Prix Carburant",
+  "version": "0.2.0",
+  "documentation": "https://github.com/Userfreedu42/hass-prixcarburant",
+  "requirements": [],
+  "codeowners": [],
+  "config_flow": true,
+  "iot_class": "cloud_polling",
+  "platforms": [
+    "sensor",
+    "binary_sensor"
+  ]
+}
