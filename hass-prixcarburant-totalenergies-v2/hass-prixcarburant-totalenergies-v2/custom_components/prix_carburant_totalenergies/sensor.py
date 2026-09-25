@@ -1,29 +1,61 @@
+from __future__ import annotations
+
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.const import UnitOfVolume
 from homeassistant.helpers.entity import DeviceInfo
-from .const import DOMAIN,FUEL_LABELS
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-async def async_setup_entry(hass,entry,add):
-    c=hass.data[DOMAIN][entry.entry_id]
-    ents=[]
-    for sid in c.data:
-        for f,l in FUEL_LABELS.items():ents.append(Fuel(c,sid,f,l))
-    add(ents)
+from .const import DOMAIN, FUEL_LABELS
 
-class Fuel(SensorEntity):
-    _attr_native_unit_of_measurement=UnitOfVolume.LITERS
-    def __init__(self,c,sid,f,l):
-        self.c=c;self.sid=sid;self.f=f;self._attr_name=f"TotalEnergies {sid} — {l}"
-        self._attr_unique_id=f"totalenergies_{sid}_{f}"
-        self._attr_device_info=DeviceInfo(identifiers={(DOMAIN,sid)},name=f"TotalEnergies — {sid}",manufacturer="TotalEnergies")
+
+async def async_setup_entry(hass, entry, async_add_entities) -> None:
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    entities = [
+        Fuel(coordinator, station_id, fuel, label)
+        for station_id in coordinator.data
+        for fuel, label in FUEL_LABELS.items()
+    ]
+    async_add_entities(entities)
+
+
+class Fuel(CoordinatorEntity, SensorEntity):
+    _attr_native_unit_of_measurement = UnitOfVolume.LITERS
+    _attr_should_poll = False
+
+    def __init__(self, coordinator, station_id: str, fuel: str, label: str) -> None:
+        super().__init__(coordinator)
+        self.station_id = station_id
+        self.fuel = fuel
+        self._attr_name = f"TotalEnergies {station_id} — {label}"
+        self._attr_unique_id = f"totalenergies_{station_id}_{fuel}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, station_id)},
+            name=f"TotalEnergies — {station_id}",
+            manufacturer="TotalEnergies",
+        )
+
     @property
     def native_value(self):
-        x=self.c.data.get(self.sid,{}).get("fuels",{}).get(self.f)
-        return x.get("price") if x else None
+        fuel = self.coordinator.data.get(self.station_id, {}).get("fuels", {}).get(self.fuel)
+        return fuel.get("price") if fuel and fuel.get("price_status") != "rupture" else None
+
     @property
     def extra_state_attributes(self):
-        s=self.c.data[self.sid];x=s.get("fuels",{}).get(self.f,{})
-        return {"station_id":self.sid,"price_status":"rupture" if x.get("price")=="rupture" else "available",
-                "price_updated":x.get("updated"),"distance_km":s.get("distance_km"),
-                "latitude":s.get("latitude"),"longitude":s.get("longitude"),"address":s.get("address"),
-                "postal_code":s.get("postal_code"),"city":s.get("city"),"services":s.get("services",[])}
+        station = self.coordinator.data.get(self.station_id, {})
+        fuel = station.get("fuels", {}).get(self.fuel, {})
+        return {
+            "station_id": self.station_id,
+            "price_status": fuel.get("price_status", "unknown"),
+            "price_updated": fuel.get("updated"),
+            "rupture": fuel.get("rupture", False),
+            "rupture_type": fuel.get("rupture_type"),
+            "rupture_start": fuel.get("rupture_start"),
+            "rupture_end": fuel.get("rupture_end"),
+            "distance_km": station.get("distance_km"),
+            "latitude": station.get("latitude"),
+            "longitude": station.get("longitude"),
+            "address": station.get("address"),
+            "postal_code": station.get("postal_code"),
+            "city": station.get("city"),
+            "services": station.get("services", []),
+        }
