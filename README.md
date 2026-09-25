@@ -1,12 +1,12 @@
-# TotalEnergies Prix Carburant
+# Prix Carburant Total Énergies
 
-Intégration Home Assistant pour récupérer les prix des carburants TotalEnergies à partir du flux officiel des prix carburant.
+Intégration Home Assistant pour récupérer les prix des carburants des stations Total Énergies à partir du flux officiel des prix carburant.
 
 ## Installation HACS
 
 1. Dans HACS → Intégrations → menu ⋮ → Dépôts personnalisés.
 2. Ajouter `Userfreedu42/hass-prixcarburant-totalenergies` comme **Integration**.
-3. Installer **TotalEnergies Prix Carburant**.
+3. Installer **Prix Carburant Total Energies**.
 4. Redémarrer Home Assistant.
 5. Ajouter l'intégration depuis **Paramètres → Appareils et services → Ajouter une intégration**.
 
