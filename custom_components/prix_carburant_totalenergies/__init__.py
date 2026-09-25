@@ -1,21 +1,31 @@
 from __future__ import annotations
 
 import io
+import logging
 import math
 import zipfile
 import xml.etree.ElementTree as ET
-import logging
 from datetime import timedelta
 
 import aiohttp
-from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN, DEFAULT_SCAN_MINUTES, INSTANT_URL
 
 _LOGGER = logging.getLogger(__name__)
 PLATFORMS = ["sensor", "binary_sensor"]
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+TOTAL_BRANDS = {
+    "total",
+    "totalenergies",
+    "total energies",
+    "totalenergies access",
+    "total energies access",
+    "total access",
+    "total contact",
+}
 
 
 def _local(tag):
@@ -47,16 +57,84 @@ def distance(lat1, lon1, lat2, lon2):
     return 2 * radius * math.asin(math.sqrt(q))
 
 
-def parse(raw, cfg):
+def _normalise_brand(value: str) -> str:
+    return " ".join((value or "").lower().replace("-", " ").split())
+
+
+def _fuel_key(name: str) -> str | None:
+    name = (name or "").lower().replace(" ", "")
+    if "gazole" in name or name == "diesel":
+        return "gazole"
+    if "sp95-e10" in name or "e10" in name:
+        return "e10"
+    if "sp98" in name:
+        return "sp98"
+    if "sp95" in name:
+        return "sp95"
+    if "e85" in name:
+        return "e85"
+    if "gpl" in name:
+        return "gplc"
+    return None
+
+
+async def _get_total_station_coordinates(hass: HomeAssistant, latitude: float, longitude: float, radius_km: float):
+    """Return TotalEnergies station coordinates from OpenStreetMap.
+
+    The government fuel XML deliberately does not publish station brands.
+    We therefore use OSM only to identify TotalEnergies locations, then use
+    the official government feed for the actual prices.
+    """
+    radius_m = int(radius_km * 1000)
+    query = f"""
+    [out:json][timeout:20];
+    (
+      nwr[amenity=fuel][brand~\"TotalEnergies|Total Access|Total Contact|Total\",i](around:{radius_m},{latitude},{longitude});
+      nwr[amenity=fuel][operator~\"TotalEnergies|Total Access|Total Contact|Total\",i](around:{radius_m},{latitude},{longitude});
+    );
+    out center tags;
+    """
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(OVERPASS_URL, data=query) as response:
+                response.raise_for_status()
+                data = await response.json(content_type=None)
+    except Exception as err:
+        _LOGGER.warning("Impossible de récupérer les stations TotalEnergies via OpenStreetMap: %s", err)
+        return []
+
+    stations = []
+    for element in data.get("elements", []):
+        tags = element.get("tags", {})
+        brand = _normalise_brand(tags.get("brand") or tags.get("operator") or "")
+        if not any(name in brand for name in TOTAL_BRANDS):
+            continue
+        lat = element.get("lat")
+        lon = element.get("lon")
+        if lat is None or lon is None:
+            center = element.get("center", {})
+            lat, lon = center.get("lat"), center.get("lon")
+        if lat is None or lon is None:
+            continue
+        stations.append((float(lat), float(lon), tags))
+    return stations
+
+
+def parse(raw, cfg, total_stations):
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         xml_name = next(name for name in archive.namelist() if name.lower().endswith(".xml"))
         root = ET.fromstring(archive.read(xml_name))
 
     wanted = set(map(str, cfg.get("stations", [])))
-    lat0 = cfg["latitude"]
-    lon0 = cfg["longitude"]
-    radius = cfg["radius_km"]
+    lat0 = float(cfg["latitude"])
+    lon0 = float(cfg["longitude"])
+    radius = float(cfg["radius_km"])
     result = {}
+
+    # The official feed does not expose the station brand. Match its PDV
+    # coordinates against the TotalEnergies locations obtained from OSM.
+    total_coords = [(lat, lon) for lat, lon, _tags in total_stations]
 
     for pdv in root.iter():
         if _local(pdv.tag) != "pdv":
@@ -65,40 +143,40 @@ def parse(raw, cfg):
         station_id = str(attrs.get("id", ""))
         lat = _coord(attrs.get("latitude"))
         lon = _coord(attrs.get("longitude"))
-        if lat is None or lon is None:
+        if not station_id or lat is None or lon is None:
             continue
 
         dist = distance(lat0, lon0, lat, lon)
-        if wanted and station_id not in wanted:
-            continue
-        if not wanted and dist > radius:
-            continue
+        if wanted:
+            if station_id not in wanted:
+                continue
+        else:
+            if dist > radius:
+                continue
+            if not total_coords or min(distance(lat, lon, tlat, tlon) for tlat, tlon in total_coords) > 0.25:
+                continue
 
         fuels = {}
-        for price in pdv.iter():
-            if _local(price.tag) != "prix":
-                continue
-            values = {_local(k): v for k, v in price.attrib.items()}
-            name = (values.get("nom") or "").lower()
-            if "gazole" in name:
-                fuel = "gazole"
-            elif "sp95" in name and "e10" not in name:
-                fuel = "sp95"
-            elif "sp98" in name:
-                fuel = "sp98"
-            elif "e10" in name:
-                fuel = "e10"
-            elif "e85" in name:
-                fuel = "e85"
-            elif "gpl" in name:
-                fuel = "gplc"
-            else:
-                continue
-            try:
-                value = float(values["valeur"].replace(",", ".")) if values.get("valeur") else "rupture"
-            except (ValueError, TypeError):
-                value = "rupture"
-            fuels[fuel] = {"price": value, "updated": values.get("maj")}
+        ruptures = set()
+        for element in pdv.iter():
+            tag = _local(element.tag)
+            values = {_local(k): v for k, v in element.attrib.items()}
+            if tag == "prix":
+                fuel = _fuel_key(values.get("nom", ""))
+                if not fuel:
+                    continue
+                try:
+                    value = float(str(values.get("valeur", "")).replace(",", "."))
+                except (ValueError, TypeError):
+                    value = None
+                fuels[fuel] = {"price": value, "updated": values.get("maj")}
+            elif tag == "rupture":
+                fuel = _fuel_key(values.get("nom") or values.get("fuel") or values.get("type", ""))
+                if fuel:
+                    ruptures.add(fuel)
+
+        for fuel in ruptures:
+            fuels.setdefault(fuel, {"price": None, "updated": None})["rupture"] = True
 
         result[station_id] = {
             "station_id": station_id,
@@ -155,6 +233,13 @@ class Coordinator(DataUpdateCoordinator):
                 async with session.get(INSTANT_URL) as response:
                     response.raise_for_status()
                     raw = await response.read()
-            return await self.hass.async_add_executor_job(parse, raw, self.entry.data)
+            cfg = self.entry.data
+            total_stations = await _get_total_station_coordinates(
+                self.hass,
+                float(cfg["latitude"]),
+                float(cfg["longitude"]),
+                float(cfg["radius_km"]),
+            )
+            return await self.hass.async_add_executor_job(parse, raw, cfg, total_stations)
         except Exception as err:
             raise UpdateFailed(str(err)) from err
