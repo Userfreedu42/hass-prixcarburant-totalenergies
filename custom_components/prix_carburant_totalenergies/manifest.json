@@ -1,7 +1,7 @@
 {
   "domain": "prix_carburant_totalenergies",
-  "name": "Prix Carburant Total Energie",
-  "version": "0.2.2",
+  "name": "Prix Carburant Total Energies",
+  "version": "0.2.3",
   "documentation": "https://github.com/Userfreedu42/hass-prixcarburant-totalenergies",
   "requirements": [],
   "codeowners": [],
