@@ -22,20 +22,30 @@ TOTAL_BRANDS = {
 }
 
 FUELS = {
-    "gazole": "Gazole", "sp95": "SP95", "sp98": "SP98",
-    "e10": "E10", "e85": "E85", "gplc": "GPLc",
+    "gazole": "Gazole",
+    "sp95": "SP95",
+    "sp98": "SP98",
+    "e10": "E10",
+    "e85": "E85",
+    "gplc": "GPLc",
 }
 
-INVALID_STATUS = {
-    "", "inconnu", "unknown", "inconue", "probleme", "problem", "erreur",
-    "error", "undefined", "null",
-}
+INVALID_STATUS = {"", "inconnu", "unknown", "inconue", "probleme", "problem", "erreur", "error", "undefined", "null"}
 
 
 def _norm(value: str | None) -> str:
     value = unicodedata.normalize("NFKD", str(value or ""))
     value = "".join(c for c in value if not unicodedata.combining(c))
     return " ".join(value.lower().replace("-", " ").split())
+
+
+def _station_key(value) -> str:
+    """Canonicalise a station id so 042110001 and 42110001 match the API integer id."""
+    text = str(value or "").strip()
+    try:
+        return str(int(text))
+    except (TypeError, ValueError):
+        return text
 
 
 def _fuel_key(value: str | None) -> str | None:
@@ -68,12 +78,12 @@ def _parse_json_list(value):
         return []
     try:
         parsed = json.loads(text)
-        if isinstance(parsed, list):
-            return parsed
-        if isinstance(parsed, dict):
-            return _parse_json_list(parsed)
     except (TypeError, ValueError):
-        pass
+        return []
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        return _parse_json_list(parsed)
     return []
 
 
@@ -92,7 +102,7 @@ def _parse_names(value) -> set[str]:
         items = list(value.keys())
     else:
         items = [value]
-    result: set[str] = set()
+    result = set()
     for item in items:
         if isinstance(item, dict):
             item = item.get("@nom") or item.get("nom") or item.get("name") or item.get("fuel") or ""
@@ -103,7 +113,7 @@ def _parse_names(value) -> set[str]:
 
 
 def _parse_prices(value) -> dict[str, dict]:
-    result: dict[str, dict] = {}
+    result = {}
     for item in _parse_json_list(value):
         if not isinstance(item, dict):
             continue
@@ -118,13 +128,12 @@ def _parse_prices(value) -> dict[str, dict]:
         result[key] = {
             "price": price,
             "updated": item.get("@maj") or item.get("maj") or item.get("updated"),
-            "rupture": item.get("@rupture") or item.get("rupture") or item.get("@indisponible") or item.get("indisponible"),
         }
     return result
 
 
 def _parse_rupture_field(raw) -> dict[str, dict]:
-    result: dict[str, dict] = {}
+    result = {}
     for item in _parse_json_list(raw):
         if not isinstance(item, dict):
             continue
@@ -167,7 +176,7 @@ def _parse_coordinates(row: dict) -> tuple[float, float] | None:
 
 def parse_catalog(raw: bytes) -> dict[str, dict[str, str]]:
     text = bz2.decompress(raw).decode("utf-8-sig")
-    result: dict[str, dict[str, str]] = {}
+    result = {}
     for row in csv.DictReader(io.StringIO(text)):
         raw_ids = (row.get("ref:FR:prix-carburants") or row.get("ref:FR:PrixCarburants") or "").strip()
         if not raw_ids or raw_ids.startswith("DELETE TAG"):
@@ -180,9 +189,9 @@ def parse_catalog(raw: bytes) -> dict[str, dict[str, str]]:
         name = (row.get("name") or "").strip()
         network_name = brand or operator or branch or "TotalEnergies"
         for station_id in raw_ids.split(";"):
-            station_id = station_id.strip()
-            if station_id:
-                result.setdefault(station_id, {"name": name, "brand": network_name})
+            key = _station_key(station_id)
+            if key:
+                result.setdefault(key, {"name": name, "brand": network_name})
     return result
 
 
@@ -207,22 +216,102 @@ def _nearby_where(latitude: float, longitude: float, radius_km: float) -> str:
     return f"within_distance(geom, geom'POINT({longitude} {latitude})', {radius_km} km)"
 
 
+def _fuel_record(record: dict) -> dict[str, dict]:
+    """Build visible fuels from the official v2 record.
+
+    `prix` and `rupture` are the canonical JSON fields documented by the
+    government dataset; the *_prix/*_rupture_* columns are used as fallbacks.
+    """
+    generic_prices = _parse_prices(record.get("prix"))
+    official_ruptures = _parse_rupture_field(record.get("rupture"))
+    available = _parse_names(record.get("carburants_disponibles"))
+    unavailable = _parse_names(record.get("carburants_indisponibles"))
+    temporary = _parse_names(record.get("carburants_rupture_temporaire"))
+    definitive = _parse_names(record.get("carburants_rupture_definitive"))
+    fuels = {}
+
+    for key, label in FUELS.items():
+        raw_price = record.get(f"{key}_prix")
+        updated = record.get(f"{key}_maj")
+        if raw_price in (None, "") and key in generic_prices:
+            raw_price = generic_prices[key].get("price")
+            updated = generic_prices[key].get("updated") or updated
+        try:
+            price = float(raw_price) if raw_price not in (None, "") else None
+        except (TypeError, ValueError):
+            price = None
+
+        rupture_type = record.get(f"{key}_rupture_type")
+        rupture_since = record.get(f"{key}_rupture_debut")
+        official = official_ruptures.get(key)
+
+        if official is not None:
+            rupture = True
+            rupture_type = official.get("type") or rupture_type or "declaree"
+            rupture_since = official.get("since") or rupture_since
+        elif key in definitive:
+            rupture = True
+            rupture_type = "definitive"
+        elif key in temporary:
+            rupture = True
+            rupture_type = "temporaire"
+        elif key in unavailable:
+            rupture = True
+            if not rupture_type or _norm(rupture_type) in INVALID_STATUS:
+                rupture_type = "declaree"
+        elif rupture_type and _norm(rupture_type) not in INVALID_STATUS:
+            rupture = True
+        else:
+            rupture = False
+
+        # A listed price or availability/rupture entry means the fuel exists.
+        # We never create a sensor for a genuinely unknown fuel.
+        has_data = (
+            key in generic_prices or price is not None or key in available
+            or key in unavailable or key in temporary or key in definitive
+            or official is not None
+        )
+        if not has_data:
+            continue
+
+        if rupture_type and _norm(rupture_type) in INVALID_STATUS:
+            rupture_type = None
+
+        fuels[key] = {
+            "label": label,
+            "price": price,
+            "updated": updated,
+            "rupture": rupture,
+            "rupture_type": rupture_type,
+            "rupture_since": rupture_since,
+        }
+    return fuels
+
+
 async def fetch_nearby_total_stations(session, catalog, latitude, longitude, radius_km):
     where = _nearby_where(latitude, longitude, radius_km)
-    stations: dict[str, dict] = {}
+    stations = {}
     offset = 0
+    select = (
+        "id,latitude,longitude,geom,cp,adresse,ville,services,horaires_automate_24_24,"
+        "prix,rupture,carburants_disponibles,carburants_indisponibles,"
+        "carburants_rupture_temporaire,carburants_rupture_definitive,"
+        "gazole_prix,gazole_maj,gazole_rupture_type,gazole_rupture_debut,"
+        "sp95_prix,sp95_maj,sp95_rupture_type,sp95_rupture_debut,"
+        "sp98_prix,sp98_maj,sp98_rupture_type,sp98_rupture_debut,"
+        "e10_prix,e10_maj,e10_rupture_type,e10_rupture_debut,"
+        "e85_prix,e85_maj,e85_rupture_type,e85_rupture_debut,"
+        "gplc_prix,gplc_maj,gplc_rupture_type,gplc_rupture_debut"
+    )
+
     while True:
-        page = await _api_get(session, {
-            "select": "id,latitude,longitude,geom,cp,adresse,ville,services,horaires_automate_24_24",
-            "where": where,
-            "offset": offset,
-            "limit": PAGE_SIZE,
-        })
+        page = await _api_get(session, {"select": select, "where": where, "offset": offset, "limit": PAGE_SIZE})
         rows = page.get("results", [])
         if not rows:
             break
+
         for row in rows:
-            station_id = str(row.get("id", "")).strip()
+            station_id = _station_key(row.get("id"))
             identity = catalog.get(station_id)
             if not identity:
                 continue
@@ -234,124 +323,73 @@ async def fetch_nearby_total_stations(session, catalog, latitude, longitude, rad
             city = str(row.get("ville") or "").strip()
             if not postal_code or not city:
                 continue
-            stations[station_id] = {
-                "station_id": station_id, "name": identity.get("name") or station_id,
-                "brand": identity.get("brand", "TotalEnergies"), "latitude": lat, "longitude": lon,
+
+            station = {
+                "station_id": station_id,
+                "name": identity.get("name") or station_id,
+                "brand": identity.get("brand", "TotalEnergies"),
+                "latitude": lat,
+                "longitude": lon,
                 "distance_km": round(_distance_km(latitude, longitude, lat, lon), 2),
-                "postal_code": postal_code, "address": row.get("adresse"), "city": city,
-                "services": row.get("services", {}), "automate_24_24": row.get("horaires_automate_24_24"),
-                "fuels": {},
+                "postal_code": postal_code,
+                "address": row.get("adresse"),
+                "city": city,
+                "services": row.get("services", {}),
+                "automate_24_24": row.get("horaires_automate_24_24"),
+                "fuels": _fuel_record(row),
             }
+            stations[station_id] = station
+
         if len(rows) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
+
+    _LOGGER.debug("%s stations Total trouvées, dont %s avec carburants", len(stations), sum(bool(s["fuels"]) for s in stations.values()))
     return stations
 
 
-def _invalid(value) -> bool:
-    return _norm(value) in INVALID_STATUS
-
-
-def _numeric_price(record: dict, key: str, generic_prices: dict[str, dict]) -> tuple[float | None, object]:
-    raw_price = record.get(f"{key}_prix")
-    updated = record.get(f"{key}_maj")
-    if raw_price in (None, "") and key in generic_prices:
-        raw_price = generic_prices[key].get("price")
-        updated = generic_prices[key].get("updated") or updated
-    try:
-        return (float(raw_price) if raw_price not in (None, "") else None), updated
-    except (TypeError, ValueError):
-        return None, updated
-
-
 async def update_prices(session, stations):
+    """Refresh fuel data while keeping station ids canonical.
+
+    This second pass is deliberately independent from the station discovery
+    query. It also uses the same canonical integer station id on both sides,
+    which prevents a leading-zero station id from producing an empty `fuels` map.
+    """
     station_ids = list(stations)
     if not station_ids:
         return stations
 
+    select = (
+        "id,prix,rupture,carburants_disponibles,carburants_indisponibles,"
+        "carburants_rupture_temporaire,carburants_rupture_definitive,"
+        "gazole_prix,gazole_maj,gazole_rupture_type,gazole_rupture_debut,"
+        "sp95_prix,sp95_maj,sp95_rupture_type,sp95_rupture_debut,"
+        "sp98_prix,sp98_maj,sp98_rupture_type,sp98_rupture_debut,"
+        "e10_prix,e10_maj,e10_rupture_type,e10_rupture_debut,"
+        "e85_prix,e85_maj,e85_rupture_type,e85_rupture_debut,"
+        "gplc_prix,gplc_maj,gplc_rupture_type,gplc_rupture_debut"
+    )
+
     for offset in range(0, len(station_ids), PAGE_SIZE):
         batch = station_ids[offset:offset + PAGE_SIZE]
-        numeric_ids = []
-        for station_id in batch:
-            try:
-                numeric_ids.append(str(int(station_id)))
-            except (TypeError, ValueError):
-                continue
-        if not numeric_ids:
+        ids = [_station_key(value) for value in batch if _station_key(value)]
+        if not ids:
             continue
-
         data = await _api_get(session, {
-            "select": (
-                "id,prix,rupture,carburants_disponibles,carburants_indisponibles,"
-                "carburants_rupture_temporaire,carburants_rupture_definitive,"
-                "gazole_prix,gazole_maj,gazole_rupture_type,gazole_rupture_debut,"
-                "sp95_prix,sp95_maj,sp95_rupture_type,sp95_rupture_debut,"
-                "sp98_prix,sp98_maj,sp98_rupture_type,sp98_rupture_debut,"
-                "e10_prix,e10_maj,e10_rupture_type,e10_rupture_debut,"
-                "e85_prix,e85_maj,e85_rupture_type,e85_rupture_debut,"
-                "gplc_prix,gplc_maj,gplc_rupture_type,gplc_rupture_debut"
-            ),
-            "where": f"id IN ({','.join(numeric_ids)})",
-            "limit": len(numeric_ids),
+            "select": select,
+            "where": f"id IN ({','.join(ids)})",
+            "limit": len(ids),
         })
 
+        matched = 0
         for record in data.get("results", []):
-            station_id = str(record.get("id", "")).strip()
-            station = stations.get(station_id)
-            if not station:
+            station = stations.get(_station_key(record.get("id")))
+            if station is None:
                 continue
+            station["fuels"] = _fuel_record(record)
+            matched += 1
 
-            generic_prices = _parse_prices(record.get("prix"))
-            official_ruptures = _parse_rupture_field(record.get("rupture"))
-            available = _parse_names(record.get("carburants_disponibles"))
-            unavailable = _parse_names(record.get("carburants_indisponibles"))
-            temporary = _parse_names(record.get("carburants_rupture_temporaire"))
-            definitive = _parse_names(record.get("carburants_rupture_definitive"))
-            fuels: dict[str, dict] = {}
-
-            for key, label in FUELS.items():
-                price, updated = _numeric_price(record, key, generic_prices)
-                rupture_type = record.get(f"{key}_rupture_type")
-                rupture_since = record.get(f"{key}_rupture_debut")
-                official = official_ruptures.get(key)
-                generic_rupture = generic_prices.get(key, {}).get("rupture")
-
-                if official is not None:
-                    is_rupture = True
-                    rupture_type = official.get("type") or rupture_type or "declaree"
-                    rupture_since = official.get("since") or rupture_since
-                elif key in definitive:
-                    is_rupture = True
-                    rupture_type = "definitive"
-                elif key in temporary:
-                    is_rupture = True
-                    rupture_type = "temporaire"
-                elif key in unavailable:
-                    is_rupture = True
-                    rupture_type = rupture_type if not _invalid(rupture_type) else "declaree"
-                elif rupture_type and not _invalid(rupture_type):
-                    is_rupture = True
-                elif generic_rupture not in (None, "", False, "0", 0, "false", "False"):
-                    is_rupture = True
-                    rupture_type = "declaree"
-                else:
-                    is_rupture = False
-
-                has_fuel_data = (
-                    key in generic_prices or price is not None or key in available or key in unavailable
-                    or key in temporary or key in definitive or official is not None
-                    or (rupture_type is not None and not _invalid(rupture_type))
-                )
-                if not has_fuel_data:
-                    continue
-
-                fuels[key] = {
-                    "label": label, "price": price, "updated": updated,
-                    "rupture": bool(is_rupture),
-                    "rupture_type": rupture_type if not _invalid(rupture_type) else None,
-                    "rupture_since": rupture_since,
-                }
-
-            station["fuels"] = fuels
+        if matched != len(ids):
+            _LOGGER.warning("Prix carburants: %s/%s stations reçues par l'API", matched, len(ids))
 
     return stations
