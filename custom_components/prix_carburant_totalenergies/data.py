@@ -28,28 +28,74 @@ def _norm(value: str | None) -> str:
 def _fuel_key(value: str | None) -> str | None:
     normalized = _norm(value)
     aliases = {
-        "gazole": "gazole",
-        "diesel": "gazole",
-        "diesel premier": "gazole",
-        "fioul premier": None,
-        "sp95": "sp95",
-        "sans plomb 95": "sp95",
-        "sp95 e10": "e10",
-        "sp95 e 10": "e10",
-        "e10": "e10",
-        "sp98": "sp98",
-        "sans plomb 98": "sp98",
-        "e85": "e85",
-        "superethanol e85": "e85",
-        "gplc": "gplc",
-        "gpl": "gplc",
-        "lpg": "gplc",
+        "gazole": "gazole", "diesel": "gazole", "diesel premier": "gazole",
+        "gazole premier": "gazole", "sp95": "sp95", "sans plomb 95": "sp95",
+        "sp95 e10": "e10", "sp95 e 10": "e10", "sans plomb e10": "e10",
+        "sans plomb 95 e10": "e10", "e10": "e10", "sp98": "sp98",
+        "sans plomb 98": "sp98", "excellium sp98": "sp98", "e85": "e85",
+        "superethanol e85": "e85", "gplc": "gplc", "gpl": "gplc", "lpg": "gplc",
     }
     return aliases.get(normalized)
 
 
 def _is_total(*values: str | None) -> bool:
     return any(_norm(value) in TOTAL_BRANDS for value in values if value)
+
+
+def _parse_names(value) -> set[str]:
+    """Parse a government semicolon/list field into internal fuel keys."""
+    if value is None:
+        return set()
+    if isinstance(value, list):
+        items = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return set()
+        try:
+            parsed = json.loads(text)
+            items = parsed if isinstance(parsed, list) else [parsed]
+        except (TypeError, ValueError):
+            items = text.split(";")
+    result = set()
+    for item in items:
+        if isinstance(item, dict):
+            item = item.get("@nom") or item.get("nom") or item.get("name") or ""
+        key = _fuel_key(str(item))
+        if key:
+            result.add(key)
+    return result
+
+
+def _parse_rupture_field(raw) -> dict[str, dict]:
+    """Parse the official composite 'rupture' field from the v2 feed."""
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return {}
+    result: dict[str, dict] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        key = _fuel_key(item.get("@nom") or item.get("nom") or item.get("name"))
+        if not key:
+            continue
+        rupture_type = item.get("@type") or item.get("type")
+        if _norm(str(rupture_type)) in INVALID_STATUS:
+            rupture_type = "unknown"
+        result[key] = {
+            "type": rupture_type,
+            "since": item.get("@debut") or item.get("debut"),
+            "end": item.get("@fin") or item.get("fin"),
+        }
+    return result
 
 
 def _distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -133,37 +179,6 @@ async def fetch_nearby_total_stations(session, catalog, latitude, longitude, rad
     return stations
 
 
-def _parse_rupture_field(raw) -> dict[str, dict]:
-    """Parse the official composite 'rupture' field from the v2 feed."""
-    if not raw:
-        return {}
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (TypeError, ValueError):
-            return {}
-    if isinstance(raw, dict):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return {}
-    result: dict[str, dict] = {}
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        key = _fuel_key(item.get("@nom") or item.get("nom"))
-        if not key:
-            continue
-        rupture_type = item.get("@type") or item.get("type")
-        if _norm(str(rupture_type)) in INVALID_STATUS:
-            continue
-        result[key] = {
-            "type": rupture_type,
-            "since": item.get("@debut") or item.get("debut"),
-            "end": item.get("@fin") or item.get("fin"),
-        }
-    return result
-
-
 async def update_prices(session, stations):
     station_ids = list(stations)
     for offset in range(0, len(station_ids), PAGE_SIZE):
@@ -178,44 +193,50 @@ async def update_prices(session, stations):
                 continue
 
             official_ruptures = _parse_rupture_field(record.get("rupture"))
-            available = {_norm(x) for x in str(record.get("carburants_disponibles") or "").split(";") if x}
-            unavailable = {_norm(x) for x in str(record.get("carburants_indisponibles") or "").split(";") if x}
-            temporary = {_norm(x) for x in str(record.get("carburants_rupture_temporaire") or "").split(";") if x}
-            definitive = {_norm(x) for x in str(record.get("carburants_rupture_definitive") or "").split(";") if x}
+            available = _parse_names(record.get("carburants_disponibles"))
+            unavailable = _parse_names(record.get("carburants_indisponibles"))
+            temporary = _parse_names(record.get("carburants_rupture_temporaire"))
+            definitive = _parse_names(record.get("carburants_rupture_definitive"))
             fuels = {}
+
+            _LOGGER.debug("Station %s rupture=%s disponibles=%s indisponibles=%s temporaires=%s definitives=%s", record.get("id"), official_ruptures, available, unavailable, temporary, definitive)
 
             for key, label in FUELS.items():
                 raw_price = record.get(f"{key}_prix")
                 updated = record.get(f"{key}_maj")
                 rupture_type = record.get(f"{key}_rupture_type")
                 rupture_since = record.get(f"{key}_rupture_debut")
-                label_norm = _norm(label)
 
-                # The composite official rupture field is authoritative when present.
                 official = official_ruptures.get(key)
                 if official:
                     rupture = True
                     rupture_type = official["type"]
                     rupture_since = official["since"]
-                elif label_norm in unavailable or label_norm in temporary or label_norm in definitive:
+                elif key in unavailable or key in temporary or key in definitive:
                     rupture = True
-                elif label_norm in available:
+                elif key in available:
                     rupture = False
-                elif rupture_type:
-                    rupture = _norm(str(rupture_type)) not in INVALID_STATUS
+                elif rupture_type and _norm(str(rupture_type)) not in INVALID_STATUS:
+                    rupture = True
                 else:
                     rupture = False
 
-                if rupture_type and _norm(str(rupture_type)) in INVALID_STATUS:
-                    rupture_type = None
-
+                # Important: during a shortage, the government feed may keep the
+                # last known price while removing the fuel from carburants_disponibles.
+                # If a non-empty official availability list exists, a priced fuel
+                # absent from it is therefore considered in rupture.
                 try:
                     price = float(raw_price) if raw_price is not None else None
                 except (TypeError, ValueError):
                     price = None
+                if available and key not in available and (price is not None or key in unavailable or key in temporary or key in definitive):
+                    rupture = True
+                    if not rupture_type:
+                        rupture_type = "disponibilite"
 
-                # No invented status: hide a fuel when neither a valid price nor an
-                # explicit official rupture is available.
+                if rupture_type and _norm(str(rupture_type)) in INVALID_STATUS:
+                    rupture_type = None
+
                 if price is None and not rupture:
                     continue
                 if price is None and not rupture_type and not official:
