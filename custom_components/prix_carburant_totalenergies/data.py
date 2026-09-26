@@ -15,6 +15,7 @@ PRICE_API_URL = "https://data.economie.gouv.fr/api/explore/v2.1/catalog/datasets
 PAGE_SIZE = 100
 TOTAL_BRANDS = {"total", "total energies", "totalenergies", "total access", "totalaccess", "total contact", "totalcontact", "totalenergies access", "total energies access"}
 FUELS = {"gazole": "Gazole", "sp95": "SP95", "sp98": "SP98", "e10": "E10", "e85": "E85", "gplc": "GPLc"}
+INVALID_STATUS = {"inconnu", "unknown", "probleme", "problem", "erreur", "error", "undefined", "null"}
 
 
 def _norm(value: str | None) -> str:
@@ -86,6 +87,9 @@ async def fetch_nearby_total_stations(session, catalog, latitude, longitude, rad
                 lon = float(row["longitude"]) / 100000
             except (KeyError, TypeError, ValueError):
                 continue
+            postal_code = str(row.get("cp") or "").strip()
+            if not postal_code:
+                continue
             stations[station_id] = {
                 "station_id": station_id,
                 "name": identity.get("name") or f"{identity.get('brand', 'TotalEnergies')} {station_id}",
@@ -93,7 +97,7 @@ async def fetch_nearby_total_stations(session, catalog, latitude, longitude, rad
                 "latitude": lat,
                 "longitude": lon,
                 "distance_km": round(_distance_km(latitude, longitude, lat, lon), 2),
-                "postal_code": row.get("cp"),
+                "postal_code": postal_code,
                 "address": row.get("adresse"),
                 "city": row.get("ville"),
                 "services": row.get("services", {}),
@@ -117,12 +121,27 @@ async def update_prices(session, stations):
                 continue
             fuels = {}
             for key, label in FUELS.items():
-                price = record.get(f"{key}_prix")
+                raw_price = record.get(f"{key}_prix")
                 updated = record.get(f"{key}_maj")
                 rupture_type = record.get(f"{key}_rupture_type")
                 rupture_since = record.get(f"{key}_rupture_debut")
-                if price is None and not rupture_type and updated is None:
+                status = _norm(str(rupture_type))
+                if status in INVALID_STATUS:
                     continue
-                fuels[key] = {"label": label, "price": float(price) if price is not None else None, "updated": updated, "rupture": bool(rupture_type), "rupture_type": rupture_type, "rupture_since": rupture_since}
+                try:
+                    price = float(raw_price) if raw_price is not None else None
+                except (TypeError, ValueError):
+                    price = None
+                rupture = bool(rupture_type)
+                if price is None and not rupture:
+                    continue
+                fuels[key] = {
+                    "label": label,
+                    "price": price,
+                    "updated": updated,
+                    "rupture": rupture,
+                    "rupture_type": rupture_type,
+                    "rupture_since": rupture_since,
+                }
             station["fuels"] = fuels
     return stations
