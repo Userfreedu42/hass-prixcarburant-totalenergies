@@ -13,7 +13,7 @@ from .const import DEFAULT_SCAN_MINUTES, DOMAIN
 from .data import fetch_nearby_total_stations, fetch_total_catalog, update_prices
 
 _LOGGER = logging.getLogger(__name__)
-PLATFORMS = ["sensor", "binary_sensor"]
+PLATFORMS = ["sensor"]
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
