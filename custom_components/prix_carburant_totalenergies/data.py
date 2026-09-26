@@ -3,6 +3,7 @@ from __future__ import annotations
 import bz2
 import csv
 import io
+import json
 import logging
 import unicodedata
 from math import asin, cos, radians, sin, sqrt
@@ -15,13 +16,36 @@ PRICE_API_URL = "https://data.economie.gouv.fr/api/explore/v2.1/catalog/datasets
 PAGE_SIZE = 100
 TOTAL_BRANDS = {"total", "total energies", "totalenergies", "total access", "totalaccess", "total contact", "totalcontact", "totalenergies access", "total energies access"}
 FUELS = {"gazole": "Gazole", "sp95": "SP95", "sp98": "SP98", "e10": "E10", "e85": "E85", "gplc": "GPLc"}
-INVALID_STATUS = {"inconnu", "unknown", "probleme", "problem", "erreur", "error", "undefined", "null"}
+INVALID_STATUS = {"inconnu", "unknown", "probleme", "problem", "erreur", "error", "undefined", "null", ""}
 
 
 def _norm(value: str | None) -> str:
     value = unicodedata.normalize("NFKD", value or "")
     value = "".join(c for c in value if not unicodedata.combining(c))
     return " ".join(value.lower().replace("-", " ").split())
+
+
+def _fuel_key(value: str | None) -> str | None:
+    normalized = _norm(value)
+    aliases = {
+        "gazole": "gazole",
+        "diesel": "gazole",
+        "diesel premier": "gazole",
+        "fioul premier": None,
+        "sp95": "sp95",
+        "sans plomb 95": "sp95",
+        "sp95 e10": "e10",
+        "sp95 e 10": "e10",
+        "e10": "e10",
+        "sp98": "sp98",
+        "sans plomb 98": "sp98",
+        "e85": "e85",
+        "superethanol e85": "e85",
+        "gplc": "gplc",
+        "gpl": "gplc",
+        "lpg": "gplc",
+    }
+    return aliases.get(normalized)
 
 
 def _is_total(*values: str | None) -> bool:
@@ -109,11 +133,42 @@ async def fetch_nearby_total_stations(session, catalog, latitude, longitude, rad
     return stations
 
 
+def _parse_rupture_field(raw) -> dict[str, dict]:
+    """Parse the official composite 'rupture' field from the v2 feed."""
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return {}
+    result: dict[str, dict] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        key = _fuel_key(item.get("@nom") or item.get("nom"))
+        if not key:
+            continue
+        rupture_type = item.get("@type") or item.get("type")
+        if _norm(str(rupture_type)) in INVALID_STATUS:
+            continue
+        result[key] = {
+            "type": rupture_type,
+            "since": item.get("@debut") or item.get("debut"),
+            "end": item.get("@fin") or item.get("fin"),
+        }
+    return result
+
+
 async def update_prices(session, stations):
     station_ids = list(stations)
     for offset in range(0, len(station_ids), PAGE_SIZE):
         batch = station_ids[offset:offset + PAGE_SIZE]
-        fields = ["id", "carburants_disponibles", "carburants_indisponibles", "carburants_rupture_temporaire", "carburants_rupture_definitive"]
+        fields = ["id", "rupture", "carburants_disponibles", "carburants_indisponibles", "carburants_rupture_temporaire", "carburants_rupture_definitive"]
         for fuel in FUELS:
             fields += [f"{fuel}_prix", f"{fuel}_maj", f"{fuel}_rupture_type", f"{fuel}_rupture_debut"]
         data = await _api_get(session, {"select": ",".join(fields), "where": f"id IN ({','.join(batch)})", "limit": len(batch)})
@@ -121,18 +176,28 @@ async def update_prices(session, stations):
             station = stations.get(str(record.get("id")))
             if not station:
                 continue
+
+            official_ruptures = _parse_rupture_field(record.get("rupture"))
             available = {_norm(x) for x in str(record.get("carburants_disponibles") or "").split(";") if x}
             unavailable = {_norm(x) for x in str(record.get("carburants_indisponibles") or "").split(";") if x}
             temporary = {_norm(x) for x in str(record.get("carburants_rupture_temporaire") or "").split(";") if x}
             definitive = {_norm(x) for x in str(record.get("carburants_rupture_definitive") or "").split(";") if x}
             fuels = {}
+
             for key, label in FUELS.items():
                 raw_price = record.get(f"{key}_prix")
                 updated = record.get(f"{key}_maj")
                 rupture_type = record.get(f"{key}_rupture_type")
                 rupture_since = record.get(f"{key}_rupture_debut")
                 label_norm = _norm(label)
-                if label_norm in unavailable or label_norm in temporary or label_norm in definitive:
+
+                # The composite official rupture field is authoritative when present.
+                official = official_ruptures.get(key)
+                if official:
+                    rupture = True
+                    rupture_type = official["type"]
+                    rupture_since = official["since"]
+                elif label_norm in unavailable or label_norm in temporary or label_norm in definitive:
                     rupture = True
                 elif label_norm in available:
                     rupture = False
@@ -140,16 +205,22 @@ async def update_prices(session, stations):
                     rupture = _norm(str(rupture_type)) not in INVALID_STATUS
                 else:
                     rupture = False
+
                 if rupture_type and _norm(str(rupture_type)) in INVALID_STATUS:
                     rupture_type = None
+
                 try:
                     price = float(raw_price) if raw_price is not None else None
                 except (TypeError, ValueError):
                     price = None
+
+                # No invented status: hide a fuel when neither a valid price nor an
+                # explicit official rupture is available.
                 if price is None and not rupture:
                     continue
-                if price is None and not rupture_type and label_norm not in unavailable and label_norm not in temporary and label_norm not in definitive:
+                if price is None and not rupture_type and not official:
                     continue
+
                 fuels[key] = {
                     "label": label,
                     "price": price,
