@@ -1,6 +1,7 @@
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.const import UnitOfVolume
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, FUEL_LABELS
 
@@ -18,9 +19,9 @@ async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities(entities)
 
 
-class _BaseFuelEntity(SensorEntity):
+class _BaseFuelEntity(CoordinatorEntity, SensorEntity):
     def __init__(self, coordinator, station_id, fuel, label):
-        self.coordinator = coordinator
+        super().__init__(coordinator)
         self.station_id = station_id
         self.fuel = fuel
         self.label = label
@@ -76,7 +77,7 @@ class Fuel(_BaseFuelEntity):
 
 
 class FuelStatus(_BaseFuelEntity):
-    """Text status so Home Assistant displays exactly 'Non' or 'Rupture'."""
+    """Text status: exactly 'Non' or 'Rupture'."""
 
     def __init__(self, coordinator, station_id, fuel, label):
         super().__init__(coordinator, station_id, fuel, label)
