@@ -4,7 +4,7 @@
 
 Intégration Home Assistant pour récupérer les prix et les ruptures des carburants des stations TotalEnergies.
 
-Les stations sont croisées avec le catalogue **stations-service-1** et les prix/ruptures proviennent du flux instantané v2 de la DGCCRF. Le flux officiel est mis à jour toutes les 10 minutes. citeturn7search2
+Les stations sont croisées avec le catalogue **stations-service-1** et les prix/ruptures proviennent du flux instantané v2 de la DGCCRF. Le flux officiel est mis à jour toutes les 10 minutes.
 
 ## Installation HACS
 
@@ -26,10 +26,10 @@ L'intégration utilise la position configurée dans Home Assistant pour recherch
 - nom des appareils au format `code postal — ville` ;
 - les capteurs de carburant restent nommés simplement `Gazole`, `E10`, `SP98`, etc. et les capteurs de statut `Gazole — Rupture`, etc.
 
-Le schéma v2.1 documente bien `rupture`, `carburants_disponibles`, `carburants_indisponibles`, `carburants_rupture_temporaire`, `carburants_rupture_definitive` et les champs `*_rupture_type`. citeturn1search0turn7search2
+Le schéma v2.1 documente `rupture`, `carburants_disponibles`, `carburants_indisponibles`, `carburants_rupture_temporaire`, `carburants_rupture_definitive` et les champs `*_rupture_type`.
 
 ### À propos de TotalEnergies
 
-La carte officielle TotalEnergies permet de retrouver les stations et les carburants/services proposés. citeturn0search0 Pour l'état **Rupture / Non**, l'intégration utilise le flux gouvernemental officiel, qui expose explicitement les ruptures par carburant ; c'est la source machine-readable la plus adaptée pour Home Assistant. citeturn1search0
+La carte officielle TotalEnergies permet de retrouver les stations et les carburants/services proposés. Pour l'état **Rupture / Non**, l'intégration utilise le flux gouvernemental officiel, qui expose explicitement les ruptures par carburant.
 
 Carburants pris en charge : Gazole, SP95, SP98, E10, E85 et GPLc.
