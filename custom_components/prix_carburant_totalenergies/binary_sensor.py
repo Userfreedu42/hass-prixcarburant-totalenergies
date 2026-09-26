@@ -25,7 +25,8 @@ class Shortage(BinarySensorEntity):
         postal_code = str(station.get("postal_code") or "").strip()
         city = str(station.get("city") or "").strip()
         station_name = " — ".join(part for part in (postal_code, city) if part) or station_id
-        self._attr_name = f"{station_name} — {value['label']} — Rupture"
+        # Le nom de la station est porté par l'appareil ; l'entité de rupture reste concise.
+        self._attr_name = f"{value['label']} — Rupture"
         self._attr_unique_id = f"totalenergies_{station_id}_{fuel}_shortage"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, station_id)},
