@@ -30,17 +30,19 @@ FUELS = {
     "gplc": "GPLc",
 }
 
-INVALID_STATUS = {"", "inconnu", "unknown", "inconue", "probleme", "problem", "erreur", "error", "undefined", "null"}
+INVALID_STATUS = {
+    "", "inconnu", "unknown", "inconue", "probleme", "problem",
+    "erreur", "error", "undefined", "null", "nan",
+}
 
 
 def _norm(value: str | None) -> str:
     value = unicodedata.normalize("NFKD", str(value or ""))
     value = "".join(c for c in value if not unicodedata.combining(c))
-    return " ".join(value.lower().replace("-", " ").split())
+    return " ".join(value.lower().replace("-", " ").replace("_", " ").split())
 
 
 def _station_key(value) -> str:
-    """Canonicalise a station id so 042110001 and 42110001 match the API integer id."""
     text = str(value or "").strip()
     try:
         return str(int(text))
@@ -49,15 +51,18 @@ def _station_key(value) -> str:
 
 
 def _fuel_key(value: str | None) -> str | None:
+    normalized = _norm(value)
     aliases = {
-        "gazole": "gazole", "diesel": "gazole", "diesel premier": "gazole", "gazole premier": "gazole",
+        "gazole": "gazole", "diesel": "gazole", "diesel premier": "gazole",
+        "gazole premier": "gazole", "excellium diesel": "gazole",
         "sp95": "sp95", "sans plomb 95": "sp95",
-        "sp95 e10": "e10", "sp95 e 10": "e10", "sans plomb e10": "e10", "sans plomb 95 e10": "e10", "e10": "e10",
+        "sp95 e10": "e10", "sp95 e 10": "e10", "sans plomb e10": "e10",
+        "sans plomb 95 e10": "e10", "sp95 e 10": "e10", "e10": "e10",
         "sp98": "sp98", "sans plomb 98": "sp98", "excellium sp98": "sp98",
         "e85": "e85", "superethanol e85": "e85", "super ethanol e85": "e85",
-        "gplc": "gplc", "gpl": "gplc", "lpg": "gplc",
+        "gplc": "gplc", "gpl": "gplc", "gpl c": "gplc", "lpg": "gplc",
     }
-    return aliases.get(_norm(value))
+    return aliases.get(normalized)
 
 
 def _is_total(*values: str | None) -> bool:
@@ -72,7 +77,15 @@ def _parse_json_list(value):
     if isinstance(value, dict):
         if any(k in value for k in ("@nom", "nom", "name", "fuel")):
             return [value]
-        return [{"@nom": key, **(item if isinstance(item, dict) else {"value": item})} for key, item in value.items()]
+        items = []
+        for key, item in value.items():
+            if isinstance(item, dict):
+                obj = dict(item)
+                obj.setdefault("@nom", key)
+            else:
+                obj = {"@nom": key, "value": item}
+            items.append(obj)
+        return items
     text = str(value).strip()
     if not text:
         return []
@@ -80,33 +93,30 @@ def _parse_json_list(value):
         parsed = json.loads(text)
     except (TypeError, ValueError):
         return []
-    if isinstance(parsed, list):
-        return parsed
-    if isinstance(parsed, dict):
-        return _parse_json_list(parsed)
-    return []
+    return _parse_json_list(parsed)
+
+
+def _fuel_from_item(item) -> str | None:
+    if isinstance(item, dict):
+        return _fuel_key(
+            item.get("@nom") or item.get("nom") or item.get("name")
+            or item.get("fuel") or item.get("carburant") or item.get("product")
+        )
+    return _fuel_key(str(item))
 
 
 def _parse_names(value) -> set[str]:
     if value is None:
         return set()
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return set()
-        parsed = _parse_json_list(text)
-        items = parsed if parsed else text.replace("\n", ";").replace(",", ";").split(";")
-    elif isinstance(value, list):
-        items = value
-    elif isinstance(value, dict):
-        items = list(value.keys())
+    parsed = _parse_json_list(value)
+    if parsed:
+        items = parsed
     else:
-        items = [value]
+        text = str(value).strip()
+        items = text.replace("\n", ";").replace(",", ";").split(";") if text else []
     result = set()
     for item in items:
-        if isinstance(item, dict):
-            item = item.get("@nom") or item.get("nom") or item.get("name") or item.get("fuel") or ""
-        key = _fuel_key(str(item))
+        key = _fuel_from_item(item)
         if key:
             result.add(key)
     return result
@@ -117,12 +127,15 @@ def _parse_prices(value) -> dict[str, dict]:
     for item in _parse_json_list(value):
         if not isinstance(item, dict):
             continue
-        key = _fuel_key(item.get("@nom") or item.get("nom") or item.get("name") or item.get("fuel"))
+        key = _fuel_from_item(item)
         if not key:
             continue
-        raw = item.get("@valeur") or item.get("valeur") or item.get("price") or item.get("value")
+        raw = (
+            item.get("@valeur") or item.get("valeur") or item.get("price")
+            or item.get("value") or item.get("prix")
+        )
         try:
-            price = float(raw) if raw not in (None, "") else None
+            price = float(str(raw).replace(",", ".")) if raw not in (None, "") else None
         except (TypeError, ValueError):
             price = None
         result[key] = {
@@ -133,21 +146,54 @@ def _parse_prices(value) -> dict[str, dict]:
 
 
 def _parse_rupture_field(raw) -> dict[str, dict]:
+    """Parse all known shapes of the government's rupture field.
+
+    Depending on the dataset/API serialization, rupture may be an array of
+    objects, a JSON object keyed by fuel, or a textual value. The presence of
+    a fuel entry in this field is itself treated as an explicit rupture.
+    """
     result = {}
+
     for item in _parse_json_list(raw):
-        if not isinstance(item, dict):
-            continue
-        key = _fuel_key(item.get("@nom") or item.get("nom") or item.get("name") or item.get("fuel"))
+        key = _fuel_from_item(item)
         if not key:
             continue
-        rupture_type = item.get("@type") or item.get("type")
-        if _norm(rupture_type) in INVALID_STATUS:
-            rupture_type = None
+
+        if isinstance(item, dict):
+            rupture_type = (
+                item.get("@type") or item.get("type") or item.get("status")
+                or item.get("etat") or item.get("state") or item.get("value")
+            )
+            # A nested object can use `rupture` as its boolean/value field.
+            if isinstance(rupture_type, bool):
+                rupture_type = "declaree" if rupture_type else None
+            since = item.get("@debut") or item.get("debut") or item.get("since")
+            end = item.get("@fin") or item.get("fin") or item.get("end")
+        else:
+            rupture_type = "declaree"
+            since = end = None
+
+        if rupture_type is not None and _norm(str(rupture_type)) in INVALID_STATUS:
+            rupture_type = "declaree"
+
         result[key] = {
-            "type": rupture_type,
-            "since": item.get("@debut") or item.get("debut"),
-            "end": item.get("@fin") or item.get("fin"),
+            "type": rupture_type or "declaree",
+            "since": since,
+            "end": end,
         }
+
+    # Some API serializations can be a plain string such as
+    # "Gazole;SP95-E10;SP98" or "Gazole - Rupture".
+    if not result and isinstance(raw, str):
+        text = raw.strip()
+        if text:
+            for fuel_name, key in (
+                ("gazole", "gazole"), ("diesel", "gazole"), ("sp95-e10", "e10"),
+                ("sp95 e10", "e10"), ("e10", "e10"), ("sp98", "sp98"),
+                ("e85", "e85"), ("gplc", "gplc"), ("gpl", "gplc"),
+            ):
+                if fuel_name in _norm(text):
+                    result[key] = {"type": "declaree", "since": None, "end": None}
     return result
 
 
@@ -217,11 +263,6 @@ def _nearby_where(latitude: float, longitude: float, radius_km: float) -> str:
 
 
 def _fuel_record(record: dict) -> dict[str, dict]:
-    """Build visible fuels from the official v2 record.
-
-    `prix` and `rupture` are the canonical JSON fields documented by the
-    government dataset; the *_prix/*_rupture_* columns are used as fallbacks.
-    """
     generic_prices = _parse_prices(record.get("prix"))
     official_ruptures = _parse_rupture_field(record.get("rupture"))
     available = _parse_names(record.get("carburants_disponibles"))
@@ -237,7 +278,7 @@ def _fuel_record(record: dict) -> dict[str, dict]:
             raw_price = generic_prices[key].get("price")
             updated = generic_prices[key].get("updated") or updated
         try:
-            price = float(raw_price) if raw_price not in (None, "") else None
+            price = float(str(raw_price).replace(",", ".")) if raw_price not in (None, "") else None
         except (TypeError, ValueError):
             price = None
 
@@ -257,15 +298,15 @@ def _fuel_record(record: dict) -> dict[str, dict]:
             rupture_type = "temporaire"
         elif key in unavailable:
             rupture = True
-            if not rupture_type or _norm(rupture_type) in INVALID_STATUS:
+            if not rupture_type or _norm(str(rupture_type)) in INVALID_STATUS:
                 rupture_type = "declaree"
-        elif rupture_type and _norm(rupture_type) not in INVALID_STATUS:
+        elif rupture_type and _norm(str(rupture_type)) not in INVALID_STATUS:
             rupture = True
+        elif key in available:
+            rupture = False
         else:
             rupture = False
 
-        # A listed price or availability/rupture entry means the fuel exists.
-        # We never create a sensor for a genuinely unknown fuel.
         has_data = (
             key in generic_prices or price is not None or key in available
             or key in unavailable or key in temporary or key in definitive
@@ -274,7 +315,7 @@ def _fuel_record(record: dict) -> dict[str, dict]:
         if not has_data:
             continue
 
-        if rupture_type and _norm(rupture_type) in INVALID_STATUS:
+        if rupture_type and _norm(str(rupture_type)) in INVALID_STATUS:
             rupture_type = None
 
         fuels[key] = {
@@ -323,8 +364,7 @@ async def fetch_nearby_total_stations(session, catalog, latitude, longitude, rad
             city = str(row.get("ville") or "").strip()
             if not postal_code or not city:
                 continue
-
-            station = {
+            stations[station_id] = {
                 "station_id": station_id,
                 "name": identity.get("name") or station_id,
                 "brand": identity.get("brand", "TotalEnergies"),
@@ -338,23 +378,20 @@ async def fetch_nearby_total_stations(session, catalog, latitude, longitude, rad
                 "automate_24_24": row.get("horaires_automate_24_24"),
                 "fuels": _fuel_record(row),
             }
-            stations[station_id] = station
 
         if len(rows) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
 
-    _LOGGER.debug("%s stations Total trouvées, dont %s avec carburants", len(stations), sum(bool(s["fuels"]) for s in stations.values()))
+    _LOGGER.debug(
+        "%s stations Total trouvées, dont %s avec carburants",
+        len(stations), sum(bool(s["fuels"]) for s in stations.values()),
+    )
     return stations
 
 
 async def update_prices(session, stations):
-    """Refresh fuel data while keeping station ids canonical.
-
-    This second pass is deliberately independent from the station discovery
-    query. It also uses the same canonical integer station id on both sides,
-    which prevents a leading-zero station id from producing an empty `fuels` map.
-    """
+    """Refresh prices/ruptures without erasing valid station data on a partial response."""
     station_ids = list(stations)
     if not station_ids:
         return stations
@@ -386,7 +423,10 @@ async def update_prices(session, stations):
             station = stations.get(_station_key(record.get("id")))
             if station is None:
                 continue
-            station["fuels"] = _fuel_record(record)
+            new_fuels = _fuel_record(record)
+            # Never blank a station because a transient API response is empty.
+            if new_fuels:
+                station["fuels"] = new_fuels
             matched += 1
 
         if matched != len(ids):
