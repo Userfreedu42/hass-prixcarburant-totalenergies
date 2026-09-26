@@ -2,7 +2,7 @@
 
 ![Prix Carburant](logo.svg)
 
-Intégration Home Assistant pour récupérer les prix des carburants des stations Total Énergies à partir du flux officiel des prix carburant.
+Intégration Home Assistant pour récupérer les prix des carburants des stations TotalÉnergies à partir du flux officiel des prix du carburant et des stations TotalÉnergies.
 
 ## Installation HACS
 
@@ -12,7 +12,7 @@ Intégration Home Assistant pour récupérer les prix des carburants des station
 4. Redémarrer Home Assistant.
 5. Ajouter l'intégration depuis **Paramètres → Appareils et services → Ajouter une intégration**.
 
-L'intégration utilise la position Home Assistant pour découvrir les stations dans un rayon configurable. Une sélection manuelle de stations est également disponible.
+L'intégration utilise la position de Home Assistant pour découvrir les stations dans un rayon configurable. Une sélection manuelle de stations est également disponible.
 
 Carburants pris en charge : Gazole, SP95, SP98, E10, E85 et GPLc.
 
