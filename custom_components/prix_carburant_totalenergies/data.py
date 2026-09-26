@@ -22,12 +22,8 @@ TOTAL_BRANDS = {
 }
 
 FUELS = {
-    "gazole": "Gazole",
-    "sp95": "SP95",
-    "sp98": "SP98",
-    "e10": "E10",
-    "e85": "E85",
-    "gplc": "GPLc",
+    "gazole": "Gazole", "sp95": "SP95", "sp98": "SP98",
+    "e10": "E10", "e85": "E85", "gplc": "GPLc",
 }
 
 INVALID_STATUS = {
@@ -48,7 +44,7 @@ def _fuel_key(value: str | None) -> str | None:
         "sp95": "sp95", "sans plomb 95": "sp95",
         "sp95 e10": "e10", "sp95 e 10": "e10", "sans plomb e10": "e10", "sans plomb 95 e10": "e10", "e10": "e10",
         "sp98": "sp98", "sans plomb 98": "sp98", "excellium sp98": "sp98",
-        "e85": "e85", "superethanol e85": "e85",
+        "e85": "e85", "superethanol e85": "e85", "super ethanol e85": "e85",
         "gplc": "gplc", "gpl": "gplc", "lpg": "gplc",
     }
     return aliases.get(_norm(value))
@@ -64,33 +60,38 @@ def _parse_json_list(value):
     if isinstance(value, list):
         return value
     if isinstance(value, dict):
-        return [value]
+        if any(k in value for k in ("@nom", "nom", "name", "fuel")):
+            return [value]
+        return [{"@nom": key, **(item if isinstance(item, dict) else {"value": item})} for key, item in value.items()]
     text = str(value).strip()
     if not text:
         return []
     try:
         parsed = json.loads(text)
-        return parsed if isinstance(parsed, list) else [parsed]
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            return _parse_json_list(parsed)
     except (TypeError, ValueError):
-        return []
+        pass
+    return []
 
 
 def _parse_names(value) -> set[str]:
-    """Parse a semicolon-separated fuel list."""
     if value is None:
         return set()
-    if isinstance(value, list):
-        items = value
-    else:
-        text = str(value).strip()
+    if isinstance(value, str):
+        text = value.strip()
         if not text:
             return set()
-        try:
-            parsed = json.loads(text)
-            items = parsed if isinstance(parsed, list) else [parsed]
-        except (TypeError, ValueError):
-            items = text.split(";")
-
+        parsed = _parse_json_list(text)
+        items = parsed if parsed else text.replace("\n", ";").replace(",", ";").split(";")
+    elif isinstance(value, list):
+        items = value
+    elif isinstance(value, dict):
+        items = list(value.keys())
+    else:
+        items = [value]
     result: set[str] = set()
     for item in items:
         if isinstance(item, dict):
@@ -102,11 +103,6 @@ def _parse_names(value) -> set[str]:
 
 
 def _parse_prices(value) -> dict[str, dict]:
-    """Parse the authoritative generic `prix` field from the v2 dataset.
-
-    The v2 API documents `prix` as a JSON array such as:
-    [{"@nom":"Gazole","@valeur":"2.398",...}].
-    """
     result: dict[str, dict] = {}
     for item in _parse_json_list(value):
         if not isinstance(item, dict):
@@ -114,7 +110,7 @@ def _parse_prices(value) -> dict[str, dict]:
         key = _fuel_key(item.get("@nom") or item.get("nom") or item.get("name") or item.get("fuel"))
         if not key:
             continue
-        raw = item.get("@valeur") or item.get("valeur") or item.get("price")
+        raw = item.get("@valeur") or item.get("valeur") or item.get("price") or item.get("value")
         try:
             price = float(raw) if raw not in (None, "") else None
         except (TypeError, ValueError):
@@ -122,6 +118,7 @@ def _parse_prices(value) -> dict[str, dict]:
         result[key] = {
             "price": price,
             "updated": item.get("@maj") or item.get("maj") or item.get("updated"),
+            "rupture": item.get("@rupture") or item.get("rupture") or item.get("@indisponible") or item.get("indisponible"),
         }
     return result
 
@@ -148,8 +145,7 @@ def _parse_rupture_field(raw) -> dict[str, dict]:
 def _distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     radius = 6371.0088
     p1, p2 = radians(lat1), radians(lat2)
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
+    dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
     a = sin(dlat / 2) ** 2 + cos(p1) * cos(p2) * sin(dlon / 2) ** 2
     return 2 * radius * asin(sqrt(a))
 
@@ -239,28 +235,21 @@ async def fetch_nearby_total_stations(session, catalog, latitude, longitude, rad
             if not postal_code or not city:
                 continue
             stations[station_id] = {
-                "station_id": station_id,
-                "name": identity.get("name") or station_id,
-                "brand": identity.get("brand", "TotalEnergies"),
-                "latitude": lat,
-                "longitude": lon,
+                "station_id": station_id, "name": identity.get("name") or station_id,
+                "brand": identity.get("brand", "TotalEnergies"), "latitude": lat, "longitude": lon,
                 "distance_km": round(_distance_km(latitude, longitude, lat, lon), 2),
-                "postal_code": postal_code,
-                "address": row.get("adresse"),
-                "city": city,
-                "services": row.get("services", {}),
-                "automate_24_24": row.get("horaires_automate_24_24"),
+                "postal_code": postal_code, "address": row.get("adresse"), "city": city,
+                "services": row.get("services", {}), "automate_24_24": row.get("horaires_automate_24_24"),
                 "fuels": {},
             }
         if len(rows) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
-    _LOGGER.debug("%s stations Total trouvées dans %.1f km", len(stations), radius_km)
     return stations
 
 
-def _field_is_invalid(value) -> bool:
-    return value is not None and _norm(str(value)) in INVALID_STATUS
+def _invalid(value) -> bool:
+    return _norm(value) in INVALID_STATUS
 
 
 def _numeric_price(record: dict, key: str, generic_prices: dict[str, dict]) -> tuple[float | None, object]:
@@ -276,13 +265,6 @@ def _numeric_price(record: dict, key: str, generic_prices: dict[str, dict]) -> t
 
 
 async def update_prices(session, stations):
-    """Refresh TotalEnergies fuel prices and official rupture information.
-
-    Important: the v2 dataset has two representations. The generic `prix` and
-    `rupture` fields are the canonical JSON representation, while the *_prix
-    and *_rupture_* columns are convenience columns. We use both so a change
-    in one representation cannot make all station fuels disappear.
-    """
     station_ids = list(stations)
     if not station_ids:
         return stations
@@ -313,13 +295,11 @@ async def update_prices(session, stations):
             "limit": len(numeric_ids),
         })
 
-        found_ids: set[str] = set()
         for record in data.get("results", []):
             station_id = str(record.get("id", "")).strip()
             station = stations.get(station_id)
             if not station:
                 continue
-            found_ids.add(station_id)
 
             generic_prices = _parse_prices(record.get("prix"))
             official_ruptures = _parse_rupture_field(record.get("rupture"))
@@ -334,58 +314,44 @@ async def update_prices(session, stations):
                 rupture_type = record.get(f"{key}_rupture_type")
                 rupture_since = record.get(f"{key}_rupture_debut")
                 official = official_ruptures.get(key)
+                generic_rupture = generic_prices.get(key, {}).get("rupture")
 
-                # If a fuel is explicitly marked with an invalid status, only
-                # hide it when there is no other authoritative information.
-                invalid_column_status = _field_is_invalid(rupture_type)
-
-                is_rupture = False
-                if official:
+                if official is not None:
                     is_rupture = True
-                    rupture_type = official.get("type") or rupture_type
+                    rupture_type = official.get("type") or rupture_type or "declaree"
                     rupture_since = official.get("since") or rupture_since
-                elif key in unavailable or key in temporary or key in definitive:
+                elif key in definitive:
                     is_rupture = True
-                    if key in definitive:
-                        rupture_type = "definitive"
-                    elif key in temporary:
-                        rupture_type = "temporaire"
-                elif key in available:
+                    rupture_type = "definitive"
+                elif key in temporary:
+                    is_rupture = True
+                    rupture_type = "temporaire"
+                elif key in unavailable:
+                    is_rupture = True
+                    rupture_type = rupture_type if not _invalid(rupture_type) else "declaree"
+                elif rupture_type and not _invalid(rupture_type):
+                    is_rupture = True
+                elif generic_rupture not in (None, "", False, "0", 0, "false", "False"):
+                    is_rupture = True
+                    rupture_type = "declaree"
+                else:
                     is_rupture = False
-                elif rupture_type and not invalid_column_status:
-                    is_rupture = True
 
-                # A fuel explicitly present in `prix` or in a valid availability
-                # list must remain visible even when the convenience rupture
-                # column is empty/unknown.
-                has_fuel_data = key in generic_prices or price is not None or key in available or key in unavailable or key in temporary or key in definitive or official is not None
+                has_fuel_data = (
+                    key in generic_prices or price is not None or key in available or key in unavailable
+                    or key in temporary or key in definitive or official is not None
+                    or (rupture_type is not None and not _invalid(rupture_type))
+                )
                 if not has_fuel_data:
                     continue
 
-                # Unknown/problematic values are excluded only when they are the
-                # only information we have for that fuel.
-                if invalid_column_status and not has_fuel_data:
-                    continue
-
                 fuels[key] = {
-                    "label": label,
-                    "price": price,
-                    "updated": updated,
-                    "rupture": is_rupture,
-                    "rupture_type": rupture_type if not _field_is_invalid(rupture_type) else None,
+                    "label": label, "price": price, "updated": updated,
+                    "rupture": bool(is_rupture),
+                    "rupture_type": rupture_type if not _invalid(rupture_type) else None,
                     "rupture_since": rupture_since,
                 }
 
             station["fuels"] = fuels
-            _LOGGER.debug(
-                "Station %s: fuels=%s ruptures=%s",
-                station_id,
-                sorted(fuels),
-                sorted(k for k, v in fuels.items() if v.get("rupture")),
-            )
-
-        missing = set(batch) - found_ids
-        if missing:
-            _LOGGER.warning("Stations Total absentes de la réponse prix : %s", sorted(missing))
 
     return stations
