@@ -24,8 +24,8 @@ def _norm(value: str | None) -> str:
     return " ".join(value.lower().replace("-", " ").split())
 
 
-def _is_total(brand: str | None) -> bool:
-    return _norm(brand) in TOTAL_BRANDS
+def _is_total(*values: str | None) -> bool:
+    return any(_norm(value) in TOTAL_BRANDS for value in values if value)
 
 
 def _distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -43,14 +43,16 @@ def parse_catalog(raw: bytes) -> dict[str, dict[str, str]]:
         raw_ids = (row.get("ref:FR:prix-carburants") or row.get("ref:FR:PrixCarburants") or "").strip()
         if not raw_ids or raw_ids.startswith("DELETE TAG"):
             continue
-        brand = (row.get("brand") or row.get("operator") or row.get("branch") or "").strip()
-        if not _is_total(brand):
+        brand = (row.get("brand") or "").strip()
+        operator = (row.get("operator") or "").strip()
+        branch = (row.get("branch") or "").strip()
+        if not _is_total(brand, operator, branch):
             continue
         name = (row.get("name") or "").strip()
         for station_id in raw_ids.split(";"):
             station_id = station_id.strip()
-            if station_id and station_id not in result:
-                result[station_id] = {"name": name, "brand": brand}
+            if station_id:
+                result.setdefault(station_id, {"name": name, "brand": brand or operator or branch or "TotalEnergies"})
     return result
 
 
@@ -111,7 +113,7 @@ async def update_prices(session, stations):
     station_ids = list(stations)
     for offset in range(0, len(station_ids), PAGE_SIZE):
         batch = station_ids[offset:offset + PAGE_SIZE]
-        fields = ["id"]
+        fields = ["id", "carburants_disponibles", "carburants_indisponibles", "carburants_rupture_temporaire", "carburants_rupture_definitive"]
         for fuel in FUELS:
             fields += [f"{fuel}_prix", f"{fuel}_maj", f"{fuel}_rupture_type", f"{fuel}_rupture_debut"]
         data = await _api_get(session, {"select": ",".join(fields), "where": f"id IN ({','.join(batch)})", "limit": len(batch)})
@@ -119,21 +121,34 @@ async def update_prices(session, stations):
             station = stations.get(str(record.get("id")))
             if not station:
                 continue
+            available = {_norm(x) for x in str(record.get("carburants_disponibles") or "").split(";") if x}
+            unavailable = {_norm(x) for x in str(record.get("carburants_indisponibles") or "").split(";") if x}
+            temporary = {_norm(x) for x in str(record.get("carburants_rupture_temporaire") or "").split(";") if x}
+            definitive = {_norm(x) for x in str(record.get("carburants_rupture_definitive") or "").split(";") if x}
             fuels = {}
             for key, label in FUELS.items():
                 raw_price = record.get(f"{key}_prix")
                 updated = record.get(f"{key}_maj")
                 rupture_type = record.get(f"{key}_rupture_type")
                 rupture_since = record.get(f"{key}_rupture_debut")
-                status = _norm(str(rupture_type))
-                if status in INVALID_STATUS:
-                    continue
+                label_norm = _norm(label)
+                if label_norm in unavailable or label_norm in temporary or label_norm in definitive:
+                    rupture = True
+                elif label_norm in available:
+                    rupture = False
+                elif rupture_type:
+                    rupture = _norm(str(rupture_type)) not in INVALID_STATUS
+                else:
+                    rupture = False
+                if rupture_type and _norm(str(rupture_type)) in INVALID_STATUS:
+                    rupture_type = None
                 try:
                     price = float(raw_price) if raw_price is not None else None
                 except (TypeError, ValueError):
                     price = None
-                rupture = bool(rupture_type)
                 if price is None and not rupture:
+                    continue
+                if price is None and not rupture_type and label_norm not in unavailable and label_norm not in temporary and label_norm not in definitive:
                     continue
                 fuels[key] = {
                     "label": label,
