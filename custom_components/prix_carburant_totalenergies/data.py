@@ -13,6 +13,7 @@ import aiohttp
 _LOGGER = logging.getLogger(__name__)
 STATIONS_CATALOG_URL = "https://www.data.gouv.fr/api/1/datasets/r/fcab3bd4-6c6d-4b73-95d2-cfd5e04ee651"
 PRICE_API_URL = "https://data.economie.gouv.fr/api/explore/v2.1/catalog/datasets/prix-des-carburants-en-france-flux-instantane-v2/records"
+DAILY_API_URL = "https://data.economie.gouv.fr/api/explore/v2.1/catalog/datasets/prix-carburants-quotidien/records"
 PAGE_SIZE = 100
 TOTAL_BRANDS = {"total", "total energies", "totalenergies", "total access", "totalaccess", "total contact", "totalcontact", "totalenergies access", "total energies access"}
 FUELS = {"gazole": "Gazole", "sp95": "SP95", "sp98": "SP98", "e10": "E10", "e85": "E85", "gplc": "GPLc"}
@@ -43,7 +44,6 @@ def _is_total(*values: str | None) -> bool:
 
 
 def _parse_names(value) -> set[str]:
-    """Parse a government semicolon/list field into internal fuel keys."""
     if value is None:
         return set()
     if isinstance(value, list):
@@ -60,7 +60,7 @@ def _parse_names(value) -> set[str]:
     result = set()
     for item in items:
         if isinstance(item, dict):
-            item = item.get("@nom") or item.get("nom") or item.get("name") or ""
+            item = item.get("@nom") or item.get("nom") or item.get("name") or item.get("fuel") or ""
         key = _fuel_key(str(item))
         if key:
             result.add(key)
@@ -68,7 +68,7 @@ def _parse_names(value) -> set[str]:
 
 
 def _parse_rupture_field(raw) -> dict[str, dict]:
-    """Parse the official composite 'rupture' field from the v2 feed."""
+    """Parse the instant v2 rupture field (JSON/XML-like data)."""
     if not raw:
         return {}
     if isinstance(raw, str):
@@ -84,16 +84,30 @@ def _parse_rupture_field(raw) -> dict[str, dict]:
     for item in raw:
         if not isinstance(item, dict):
             continue
-        key = _fuel_key(item.get("@nom") or item.get("nom") or item.get("name"))
+        key = _fuel_key(item.get("@nom") or item.get("nom") or item.get("name") or item.get("fuel"))
         if not key:
             continue
         rupture_type = item.get("@type") or item.get("type")
         if _norm(str(rupture_type)) in INVALID_STATUS:
-            rupture_type = "unknown"
+            rupture_type = None
         result[key] = {
             "type": rupture_type,
             "since": item.get("@debut") or item.get("debut"),
             "end": item.get("@fin") or item.get("fin"),
+        }
+    return result
+
+
+def _parse_daily_ruptures(record: dict | None) -> dict[str, dict]:
+    if not record:
+        return {}
+    names = _parse_names(record.get("rupture_nom") or record.get("rupture"))
+    result = {}
+    for key in names:
+        result[key] = {
+            "type": None,
+            "since": record.get("rupture_debut"),
+            "end": record.get("rupture_fin"),
         }
     return result
 
@@ -136,8 +150,8 @@ async def fetch_total_catalog(session: aiohttp.ClientSession) -> dict[str, dict[
     return catalog
 
 
-async def _api_get(session: aiohttp.ClientSession, params: dict) -> dict:
-    async with session.get(PRICE_API_URL, params=params) as response:
+async def _api_get(session: aiohttp.ClientSession, params: dict, url: str = PRICE_API_URL) -> dict:
+    async with session.get(url, params=params) as response:
         response.raise_for_status()
         return await response.json()
 
@@ -187,19 +201,35 @@ async def update_prices(session, stations):
         for fuel in FUELS:
             fields += [f"{fuel}_prix", f"{fuel}_maj", f"{fuel}_rupture_type", f"{fuel}_rupture_debut"]
         data = await _api_get(session, {"select": ",".join(fields), "where": f"id IN ({','.join(batch)})", "limit": len(batch)})
+
+        # The official daily feed is the authoritative fallback for stock outages.
+        # It is deliberately crossed with the 10-minute v2 feed so a stale/missing
+        # instant rupture field does not turn an actual outage into "Non".
+        daily = await _api_get(
+            session,
+            {"select": "id,rupture_nom,rupture_debut,rupture_fin", "where": f"id IN ({','.join(batch)})", "limit": len(batch)},
+            DAILY_API_URL,
+        )
+        daily_by_id = {str(r.get("id")): _parse_daily_ruptures(r) for r in daily.get("results", [])}
+
         for record in data.get("results", []):
             station = stations.get(str(record.get("id")))
             if not station:
                 continue
 
+            station_id = str(record.get("id"))
             official_ruptures = _parse_rupture_field(record.get("rupture"))
+            daily_ruptures = daily_by_id.get(station_id, {})
             available = _parse_names(record.get("carburants_disponibles"))
             unavailable = _parse_names(record.get("carburants_indisponibles"))
             temporary = _parse_names(record.get("carburants_rupture_temporaire"))
             definitive = _parse_names(record.get("carburants_rupture_definitive"))
             fuels = {}
 
-            _LOGGER.debug("Station %s rupture=%s disponibles=%s indisponibles=%s temporaires=%s definitives=%s", record.get("id"), official_ruptures, available, unavailable, temporary, definitive)
+            _LOGGER.debug(
+                "Station %s instant_ruptures=%s daily_ruptures=%s disponibles=%s indisponibles=%s temporaires=%s definitives=%s",
+                station_id, official_ruptures, daily_ruptures, available, unavailable, temporary, definitive,
+            )
 
             for key, label in FUELS.items():
                 raw_price = record.get(f"{key}_prix")
@@ -207,11 +237,11 @@ async def update_prices(session, stations):
                 rupture_type = record.get(f"{key}_rupture_type")
                 rupture_since = record.get(f"{key}_rupture_debut")
 
-                official = official_ruptures.get(key)
+                official = official_ruptures.get(key) or daily_ruptures.get(key)
                 if official:
                     rupture = True
-                    rupture_type = official["type"]
-                    rupture_since = official["since"]
+                    rupture_type = official.get("type") or rupture_type or "declaree"
+                    rupture_since = official.get("since") or rupture_since
                 elif key in unavailable or key in temporary or key in definitive:
                     rupture = True
                 elif key in available:
@@ -221,21 +251,19 @@ async def update_prices(session, stations):
                 else:
                     rupture = False
 
-                # Important: during a shortage, the government feed may keep the
-                # last known price while removing the fuel from carburants_disponibles.
-                # If a non-empty official availability list exists, a priced fuel
-                # absent from it is therefore considered in rupture.
+                # If the official availability list exists and a fuel with a known
+                # price is missing from it, treat it as unavailable rather than OK.
+                if available and key not in available and raw_price is not None:
+                    rupture = True
+                    rupture_type = rupture_type or "disponibilite"
+
+                if rupture_type and _norm(str(rupture_type)) in INVALID_STATUS:
+                    rupture_type = None
+
                 try:
                     price = float(raw_price) if raw_price is not None else None
                 except (TypeError, ValueError):
                     price = None
-                if available and key not in available and (price is not None or key in unavailable or key in temporary or key in definitive):
-                    rupture = True
-                    if not rupture_type:
-                        rupture_type = "disponibilite"
-
-                if rupture_type and _norm(str(rupture_type)) in INVALID_STATUS:
-                    rupture_type = None
 
                 if price is None and not rupture:
                     continue
