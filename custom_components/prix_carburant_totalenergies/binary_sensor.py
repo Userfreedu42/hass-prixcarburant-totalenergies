@@ -22,12 +22,14 @@ class Shortage(BinarySensorEntity):
         self.fuel = fuel
         station = coordinator.data[station_id]
         value = station["fuels"][fuel]
-        postal_code = station.get("postal_code") or station_id
-        self._attr_name = f"{postal_code} — {value['label']} — Rupture"
+        postal_code = str(station.get("postal_code") or "").strip()
+        city = str(station.get("city") or "").strip()
+        station_name = " — ".join(part for part in (postal_code, city) if part) or station_id
+        self._attr_name = f"{station_name} — {value['label']} — Rupture"
         self._attr_unique_id = f"totalenergies_{station_id}_{fuel}_shortage"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, station_id)},
-            name=str(postal_code),
+            name=station_name,
             manufacturer="TotalEnergies",
             model=station.get("brand", "TotalEnergies"),
         )
