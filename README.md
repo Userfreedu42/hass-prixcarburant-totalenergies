@@ -1,5 +1,7 @@
 # Prix Carburant Total Énergies
 
+![Prix Carburant](logo.svg)
+
 Intégration Home Assistant pour récupérer les prix des carburants des stations Total Énergies à partir du flux officiel des prix carburant.
 
 ## Installation HACS
