@@ -140,7 +140,17 @@ async def _api_get(session: aiohttp.ClientSession, params: dict) -> dict:
 
 
 def _ids_where(ids: list[str]) -> str:
-    return "id IN (" + ",".join(json.dumps(str(value)) for value in ids) + ")"
+    # Le champ `id` du flux officiel est un entier (pas un texte).
+    # Opendatasoft renvoie HTTP 400 si on compare cet entier à des chaînes.
+    numeric_ids = []
+    for value in ids:
+        try:
+            numeric_ids.append(str(int(value)))
+        except (TypeError, ValueError):
+            continue
+    if not numeric_ids:
+        return "id = -1"
+    return "id IN (" + ",".join(numeric_ids) + ")"
 
 
 async def fetch_nearby_total_stations(session, catalog, latitude, longitude, radius_km):
