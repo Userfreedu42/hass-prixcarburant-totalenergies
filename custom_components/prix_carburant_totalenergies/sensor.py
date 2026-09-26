@@ -24,12 +24,14 @@ class Fuel(SensorEntity):
         self.station_id = station_id
         self.fuel = fuel
         station = coordinator.data[station_id]
-        postal_code = station.get("postal_code") or station_id
-        self._attr_name = f"{postal_code} — {label}"
+        postal_code = str(station.get("postal_code") or "").strip()
+        city = str(station.get("city") or "").strip()
+        station_name = " — ".join(part for part in (postal_code, city) if part) or station_id
+        self._attr_name = f"{station_name} — {label}"
         self._attr_unique_id = f"totalenergies_{station_id}_{fuel}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, station_id)},
-            name=str(postal_code),
+            name=station_name,
             manufacturer="TotalEnergies",
             model=station.get("brand", "TotalEnergies"),
         )
